@@ -1,0 +1,161 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "AzureADServicePrincipalID": {
+            "type": "string",
+            "defaultValue": "<%AzureADServicePrincipalID%>",
+            "metadata": {
+                "description": "The Azure AD Service Principal ID"
+            }
+        },
+        "AzureADServicePrincipalKey": {
+            "type": "string",
+            "defaultValue": "<%AzureADServicePrincipalKey%>",
+            "metadata": {
+                "description": "The Azure AD Service Principal Key"
+            }
+        },        
+        "AnalysisServicesName": {
+            "type": "string",
+            "defaultValue": "aas<%CompanyName%><%ProjectName%><%Environment%>",
+            "metadata": {
+                "description": "The name of the Azure Analysis Service"
+            }
+        },
+        "DataFactoryName": {
+            "type": "string",
+            "defaultValue": "adf-<%CompanyName%>-<%ProjectName%>-<%Environment%>",
+            "metadata": {
+                "description": "The name of the Azure Data Factory"
+            }
+        },
+        "DataFactoryDeploymentScriptName": {
+            "type": "string",
+            "defaultValue": "ds-<%CompanyName%>-<%ProjectName%>-ps-adf-appid-<%Environment%>",
+            "metadata": {
+                "description": "The name of the Deployment script to retrive Azure Data Factory Managed Identity Application ID"
+            }
+        },
+        "DateTimeCurrent": {
+            "type": "string",
+            "defaultValue": "[utcNow()]",
+            "metadata": {
+                "description": "Get current UTC date and time"
+            }
+        }        
+    },
+    "resources": [
+        /* Create Azure Data Factory instance */
+        {
+            "type": "Microsoft.DataFactory/factories",
+            "name": "[parameters('DataFactoryName')]",
+            "apiVersion": "2018-06-01",
+            "location": "[resourceGroup().location]",
+            "identity": {
+                "type": "SystemAssigned"
+            },
+            "properties": "[null()]"
+        },
+
+        /* Retrieve Managed Identity Application ID from Azure Data Factory Instance */
+        {
+            "type": "Microsoft.Resources/deploymentScripts",
+            "apiVersion": "2020-10-01",
+            "name": "[parameters('DataFactoryDeploymentScriptName')]",
+            "location": "[resourceGroup().location]",
+            "dependsOn": [
+                "[resourceId('Microsoft.DataFactory/factories', parameters('DataFactoryName'))]"
+            ],
+            "kind": "AzurePowerShell",
+            "properties": {
+                "azPowerShellVersion": "6.4",
+                "forceUpdateTag": "[parameters('DateTimeCurrent')]",
+                "environmentVariables": [
+                    {
+                        "name": "ResourceGroup",
+                        "secureValue": "[resourceGroup().name]"
+                    },
+                    {
+                        "name": "DataFactoryName",
+                        "secureValue": "[parameters('DataFactoryName')]"
+                    },
+                    {
+                        "name": "AzureADServicePrincipalID",
+                        "secureValue": "[parameters('AzureADServicePrincipalID')]"
+                    },
+                    {
+                        "name": "AzureADServicePrincipalKey",
+                        "secureValue": "[parameters('AzureADServicePrincipalKey')]"
+                    },
+                    {
+                        "name": "TenantID",
+                        "secureValue": "[tenant().tenantId]"
+                    }
+                ],
+                "scriptContent": "
+                    $AzureADServicePrincipalKey = ConvertTo-SecureString -String ${Env:AzureADServicePrincipalKey} -AsPlainText -Force;
+                    $Credential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList ${Env:AzureADServicePrincipalID}, $AzureADServicePrincipalKey;
+                    Connect-AzAccount -ServicePrincipal -TenantId ${Env:TenantID} -Credential $Credential;
+
+                    $ADFPrincipalID = (get-AzDataFactoryV2 -ResourceGroupName ${Env:ResourceGroup} -Name ${Env:DataFactoryName}).Identity.PrincipalId;
+                    $ADFApplicationID = (Get-AzADServicePrincipal -ObjectId $ADFPrincipalId).ApplicationId.Guid;
+
+                    $DeploymentScriptOutputs = @{};
+                    $DeploymentScriptOutputs['ADFApplicationID'] = $ADFApplicationID;
+                ",
+                "cleanupPreference": "Always",
+                "retentionInterval": "P1D"
+            }
+        },
+        
+        /* Create Azure Analysis Services */
+        {
+            "type": "Microsoft.AnalysisServices/servers",
+            "apiVersion": "2017-08-01",
+            "name": "[parameters('AnalysisServicesName')]",
+            "dependsOn": [
+                "[resourceId('Microsoft.DataFactory/factories', parameters('DataFactoryName'))]",
+                "[resourceId('Microsoft.Resources/deploymentScripts', parameters('DataFactoryDeploymentScriptName'))]"
+            ],
+            "sku": {
+                "name": "S0"
+            },
+            "location": "[resourceGroup().location]",
+            "properties": {
+                "asAdministrators": {
+                    "members": "[
+                        union(
+                            createArray(concat('app:', parameters('AzureADServicePrincipalID'), '@', tenant().tenantId)),
+                            createArray(concat('app:', reference(parameters('DataFactoryDeploymentScriptName')).outputs.ADFApplicationID, '@', tenant().tenantId))               
+                        )
+                    ]"
+                },
+                "managedMode": 1
+            }
+        },
+
+        /* Assign Azure Data Factory as Contributor to the Azure Analysis Service instance */
+        {
+            "type": "Microsoft.Authorization/roleAssignments",
+            "apiVersion": "2020-04-01-preview",
+            "name": "[
+                guid(
+                    concat('/subscriptions/', subscription().subscriptionId, '/providers/Microsoft.Authorization/roleDefinitions/', 'b24988ac-6180-42a0-ab88-20f7382dd24c'), 
+                    resourceId('Microsoft.DataFactory/factories', parameters('DataFactoryName')), 
+                    resourceId('Microsoft.AnalysisServices/servers/', parameters('AnalysisServicesName'))
+                )
+            ]",
+            "scope": "[concat('Microsoft.AnalysisServices/servers', '/', parameters('AnalysisServicesName'))]",
+            "dependsOn": [
+                "[resourceId('Microsoft.DataFactory/factories', parameters('DataFactoryName'))]",
+                "[resourceId('Microsoft.AnalysisServices/servers', parameters('AnalysisServicesName'))]"
+            ],
+            "properties": {
+                "roleDefinitionId": "[concat('/subscriptions/', subscription().subscriptionId, '/providers/Microsoft.Authorization/roleDefinitions/', 'b24988ac-6180-42a0-ab88-20f7382dd24c')]",
+                "principalId": "[reference(resourceId('Microsoft.DataFactory/factories', parameters('DataFactoryName')), '2018-06-01', 'Full').identity.principalId]",
+                "principalType" : "ServicePrincipal"
+            }
+        }        
+    ]
+}
